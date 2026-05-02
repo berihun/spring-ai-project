@@ -17,6 +17,7 @@ A Spring Boot and Spring AI application for building a local call center advisor
 - Java 21
 - Spring Boot 3.3.4
 - Spring AI 1.0.1
+- Project Reactor `Flux` for streaming responses
 - Ollama for chat and embeddings
 - Qdrant for vector search
 - Elasticsearch for keyword search
@@ -105,6 +106,8 @@ http://localhost:8080
 ```
 
 ## API Endpoints
+
+The streaming endpoints return Reactor `Flux<String>`. Each emitted value is a generated text token or text fragment, so clients can display the answer while the model is still producing it.
 
 ### Stream a Direct Chat Response
 
