@@ -1,6 +1,7 @@
 package com.innovatecksolutions.springaifirstlesson.services;
 
 
+import com.innovatecksolutions.springaifirstlesson.entity.KeywordDoc;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.parser.ParseContext;
@@ -8,6 +9,10 @@ import org.apache.tika.parser.pdf.PDFParser;
 import org.apache.tika.sax.ToTextContentHandler;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.data.elasticsearch.core.ElasticsearchOperations;
+import org.springframework.data.elasticsearch.core.mapping.IndexCoordinates;
+import org.springframework.data.elasticsearch.core.query.IndexQuery;
+import org.springframework.data.elasticsearch.core.query.IndexQueryBuilder;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 import org.xml.sax.SAXException;
@@ -19,26 +24,31 @@ import java.util.Map;
 import org.springframework.ai.transformer.splitter.TokenTextSplitter;
 @Service
 public class DocumentIngestionService {
+    private final VectorStore vectorStore; // Qdrant
+    private final ElasticsearchOperations elasticsearchOperations; // Keyword
 
-    private final VectorStore vectorStore;
-
-    public DocumentIngestionService(VectorStore vectorStore) {
+    public DocumentIngestionService(VectorStore vectorStore, ElasticsearchOperations elasticsearchOperations) {
         this.vectorStore = vectorStore;
+        this.elasticsearchOperations = elasticsearchOperations;
     }
 
-    public void ingestDocument(MultipartFile file) throws IOException, TikaException, SAXException {
+    public void ingestDocument(MultipartFile file) throws Exception {
         String fullText = extractTextFromPdf(file);
-
-        // Use TokenTextSplitter (800 tokens per chunk, 100 token overlap)
         TokenTextSplitter splitter = new TokenTextSplitter(800, 100, 5, 10000, true);
+        List<Document> chunks = splitter.split(List.of(new Document(fullText, Map.of("source", file.getOriginalFilename()))));
 
-        // Convert text to a Document object then split it
-        List<Document> rawDocs = List.of(new Document(fullText, Map.of("source", file.getOriginalFilename())));
-        List<Document> chunks = splitter.split(rawDocs);
-
-        // Store in PGVector
+        // 1. Save to Qdrant (Semantic)
         vectorStore.add(chunks);
+
+        // 2. Save to Elasticsearch (Keyword)
+        for (Document doc : chunks) {
+            IndexQuery indexQuery = new IndexQueryBuilder()
+                    .withObject(new KeywordDoc(doc.getText(), (String) doc.getMetadata().get("source")))
+                    .build();
+            elasticsearchOperations.index(indexQuery, IndexCoordinates.of("manuals"));
+        }
     }
+
 
     private String extractTextFromPdf(MultipartFile file) throws IOException, TikaException, SAXException {
         try (var inputStream = file.getInputStream()) {

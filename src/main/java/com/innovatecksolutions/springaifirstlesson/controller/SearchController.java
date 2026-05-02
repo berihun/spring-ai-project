@@ -1,20 +1,25 @@
 package com.innovatecksolutions.springaifirstlesson.controller;
 
-import org.springframework.ai.chat.messages.SystemMessage;
-import org.springframework.ai.chat.messages.UserMessage;
+import com.innovatecksolutions.springaifirstlesson.entity.KeywordDoc;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.prompt.Prompt;
-import org.springframework.ai.chat.prompt.SystemPromptTemplate;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.data.elasticsearch.core.ElasticsearchOperations;
+import org.springframework.data.elasticsearch.core.SearchHit;
+import org.springframework.data.elasticsearch.core.mapping.IndexCoordinates;
+import org.springframework.data.elasticsearch.core.query.Criteria;
+import org.springframework.data.elasticsearch.core.query.CriteriaQuery;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import reactor.core.publisher.Flux;
 
+import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 @CrossOrigin(origins = "http://localhost:5173")
@@ -22,88 +27,101 @@ import java.util.stream.Collectors;
 @RequestMapping("/api/search")
 public class SearchController {
 
-    private final VectorStore vectorStore;
-    private final ChatModel chatModel; // This will use Ollama locally
+    private final VectorStore vectorStore; // Qdrant
+    private final ElasticsearchOperations elasticsearch; // Keyword
+    private final ChatModel chatModel;
+    private final StringRedisTemplate redisTemplate;
 
-    public SearchController(VectorStore vectorStore, ChatModel chatModel) {
+    public SearchController(VectorStore vectorStore, ElasticsearchOperations elasticsearch, ChatModel chatModel, StringRedisTemplate redisTemplate) {
         this.vectorStore = vectorStore;
+        this.elasticsearch = elasticsearch;
         this.chatModel = chatModel;
+        this.redisTemplate = redisTemplate;
     }
 
+    /**
+     * Performs a Hybrid Search (Semantic + Keyword) and streams the answer from the AI.
+     */
     @PostMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public Flux<String> streamSearch(@RequestBody String query) {
-        long startTime = System.currentTimeMillis();
-        System.out.println("--- Starting Search for: " + query);
+    public Flux<String> hybridSearch(@RequestBody String query) {
+        String cleanQuery = query.toLowerCase().trim();
+        String cacheKey = "hybrid:" + cleanQuery;
 
-        // 1. Reduce topK to 2 to make it faster
-        List<Document> similarDocuments = vectorStore.similaritySearch(
-                SearchRequest.builder().query(query).topK(2).similarityThreshold(0.5).build());
+        // 1. Redis Cache Check
+        String cachedValue = redisTemplate.opsForValue().get(cacheKey);
+        if (cachedValue != null) {
+            System.out.println("DEBUG: Returning cached response for: " + cleanQuery);
+            return Flux.just(cachedValue);
+        }
 
-        System.out.println("--- Vector Search took: " + (System.currentTimeMillis() - startTime) + "ms");
+        // 2. Semantic Search (Qdrant)
+        List<Document> semanticDocs = vectorStore.similaritySearch(
+                SearchRequest.builder()
+                        .query(query)
+                        .topK(3)
+                        .build()
+        );
 
-        String context = similarDocuments.stream()
-                .map(Document::getText)
-                .collect(Collectors.joining("\n\n"));
+        // 3. Keyword Search (Elasticsearch) - Using .is() to handle phrases/spaces correctly
+        CriteriaQuery keywordQuery = new CriteriaQuery(new Criteria("content").is(query));
+        List<SearchHit<KeywordDoc>> keywordDocs = elasticsearch.search(
+                keywordQuery,
+                KeywordDoc.class,
+                IndexCoordinates.of("manuals")
+        ).getSearchHits();
 
-        // 2. Prepare Prompt
+        // 4. Combine and Deduplicate Context
+        // Using LinkedHashSet to maintain order but remove duplicate text chunks
+        Set<String> contextChunks = new LinkedHashSet<>();
+        semanticDocs.forEach(doc -> contextChunks.add(doc.getText()));
+        keywordDocs.forEach(hit -> contextChunks.add(hit.getContent().content()));
+
+        String context = String.join("\n---\n", contextChunks);
+
+        // 5. Construct Prompt with Strict Instructions
         String systemInstructions = """
-            You are a Call Center Assistant. 
-            Answer the user's question briefly using the context. 
-            If the question is a greeting like 'hello', just greet them back.
+            You are a professional Call Center Assistant. 
+            Use the following context to answer the user's question.
             
-            CONTEXT: {context}
-            """;
+            STRICT RULES:
+            1. Answer ONLY using the provided context.
+            2. If the answer is not in the context, say "I'm sorry, I don't have information about that in my manuals."
+            3. Do not use your own internal knowledge or add outside facts.
+            4. Keep the answer concise and professional.
+            
+            CONTEXT:
+            %s
+            """.formatted(context);
 
-        SystemPromptTemplate systemPromptTemplate = new SystemPromptTemplate(systemInstructions);
-        var systemMessage = systemPromptTemplate.createMessage(Map.of("context", context));
-        var userMessage = new UserMessage(query);
+        Prompt prompt = new Prompt(systemInstructions + "\n\nUser Question: " + query);
 
-        System.out.println("--- Starting Llama Stream...");
+        // 6. Stream Response and Cache the Result
+        StringBuilder fullResponse = new StringBuilder();
 
-        return chatModel.stream(new Prompt(List.of(systemMessage, userMessage)))
+        return chatModel.stream(prompt)
                 .map(response -> {
                     String text = response.getResult().getOutput().getText();
+                    fullResponse.append(text);
                     return text;
+                })
+                .doOnComplete(() -> {
+                    // Cache the successful response for 1 hour
+                    if (fullResponse.length() > 0) {
+                        redisTemplate.opsForValue().set(cacheKey, fullResponse.toString(), 1, TimeUnit.HOURS);
+                    }
                 });
     }
 
-//    @PostMapping
-//    public SearchResponse search(@RequestBody String query) {
-//        // 1. SEARCH: Find the top 4 most relevant snippets from your local PGVector
-//        List<Document> similarDocuments = vectorStore.similaritySearch(
-//                SearchRequest.builder()
-//                        .query(query)
-//                        .topK(4)
-//                        .similarityThreshold(0.5)
-//                        .build());
-//
-//        // 2. CONTEXT: Combine the snippets into one block of text
-//        String context = similarDocuments.stream()
-//                .map(Document::getText)
-//                .collect(Collectors.joining("\n\n"));
-//
-//        // 3. GENERATE: Create a prompt for your local Llama/Mistral model
-//        String systemInstructions = """
-//                You are a Call Center Advisor Assistant.
-//                Use the following pieces of extracted context to answer the user's question.
-//                If you don't know the answer based on the context, say that you don't know.
-//                Provide a concise, step-by-step answer that an advisor can read quickly.
-//
-//                CONTEXT:
-//                {context}
-//                """;
-//
-//        SystemPromptTemplate systemPromptTemplate = new SystemPromptTemplate(systemInstructions);
-//        var systemMessage = systemPromptTemplate.createMessage(Map.of("context", context));
-//        var userMessage = new org.springframework.ai.chat.messages.UserMessage(query);
-//
-//        // 4. CALL LOCAL MODEL: Send to Ollama
-//        Prompt prompt = new Prompt(List.of(systemMessage, userMessage));
-//        String assistantAnswer = chatModel.call(prompt).getResult().getOutput().getText();
-//
-//        return new SearchResponse(assistantAnswer, similarDocuments);
-//    }
-
-    // Response DTO to send both the AI answer and the sources to the UI
-    public record SearchResponse(String answer, List<Document> sources) {}
+    /**
+     * Utility endpoint to wipe the Redis cache if documents change.
+     */
+    @GetMapping("/clear-cache")
+    public String clearCache() {
+        try {
+            redisTemplate.getConnectionFactory().getConnection().serverCommands().flushAll();
+            return "✅ Redis cache cleared successfully!";
+        } catch (Exception e) {
+            return "❌ Error clearing cache: " + e.getMessage();
+        }
+    }
 }
